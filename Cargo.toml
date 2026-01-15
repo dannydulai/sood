@@ -1,0 +1,24 @@
+[package]
+name = "sood"
+version = "0.1.0"
+edition = "2021"
+authors = ["Danny <danny@example.com>"]
+description = "A Rust implementation of the Sood discovery protocol used by Roon"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/sood"
+keywords = ["discovery", "sood", "roon", "multicast", "network"]
+categories = ["network-programming"]
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+socket2 = "0.6"
+if-addrs = "0.13"
+uuid = { version = "1.0", features = ["v4"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+
+[[example]]
+name = "discover"
+path = "examples/discover.rs"
