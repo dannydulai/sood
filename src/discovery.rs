@@ -493,24 +493,32 @@ impl SoodDiscovery {
 
                         // Check if it's a device announcement (Query or Response with service_id and unique_id)
                         // This handles both unsolicited Query announcements and Response messages
-                        if let (Some(Some(service_id)), Some(Some(unique_id))) = (
-                            msg.properties.get("service_id"),
-                            msg.properties.get("unique_id"),
-                        ) {
-                            let key = (service_id.clone(), unique_id.clone());
+                        if let Some(Some(service_id)) = msg.properties.get("service_id") {
+                            // Special case: ROON_OS uses serial_number instead of unique_id
+                            let unique_id = if service_id == "ecb37afa-665f-4693-9fba-54823b6f1ff1" {
+                                msg.properties.get("serial_number")
+                                    .and_then(|v| v.as_ref())
+                            } else {
+                                msg.properties.get("unique_id")
+                                    .and_then(|v| v.as_ref())
+                            };
 
-                            // Check if we've seen this device before
-                            let mut devices = discovered_devices.write().await;
-                            if !devices.contains_key(&key) {
-                                // New device - store and emit it
-                                let device = DiscoveredDevice {
-                                    from: msg.from,
-                                    service_id: service_id.clone(),
-                                    unique_id: unique_id.clone(),
-                                    properties: msg.properties.clone(),
-                                };
-                                devices.insert(key, device.clone());
-                                let _ = discovered_tx.send(device);
+                            if let Some(unique_id) = unique_id {
+                                let key = (service_id.clone(), unique_id.clone());
+
+                                // Check if we've seen this device before
+                                let mut devices = discovered_devices.write().await;
+                                if !devices.contains_key(&key) {
+                                    // New device - store and emit it
+                                    let device = DiscoveredDevice {
+                                        from: msg.from,
+                                        service_id: service_id.clone(),
+                                        unique_id: unique_id.clone(),
+                                        properties: msg.properties.clone(),
+                                    };
+                                    devices.insert(key, device.clone());
+                                    let _ = discovered_tx.send(device);
+                                }
                             }
                         }
                     } else {

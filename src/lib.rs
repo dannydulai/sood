@@ -260,8 +260,16 @@ impl Sood {
     pub async fn discover_service(&self, service_id: impl Into<String>) -> io::Result<()> {
         let service_id = service_id.into();
         let mut properties = HashMap::new();
-        properties.insert("query_service_id".to_string(), Some(service_id.clone()));
-        properties.insert("who_has_service_id".to_string(), Some(service_id));
+
+        // Special cases for different service types
+        if service_id == service_ids::ROON_OS {
+            properties.insert("who_has_service_id".to_string(), Some(service_id));
+        } else if service_id == service_ids::RAAT_ENDPOINT {
+            properties.insert("service_id".to_string(), Some(service_id));
+        } else {
+            properties.insert("query_service_id".to_string(), Some(service_id));
+        }
+
         let _responses = self.query(properties).await?;
         // Responses are automatically handled by the discovered() receiver
         // We don't need to consume them here

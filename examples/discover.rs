@@ -47,26 +47,11 @@ async fn main() -> std::io::Result<()> {
                         println!("║ 🎯 Device Found!");
                         println!("╠══════════════════════════════════════════════════");
                         println!("║ Address: {}", device.from);
-                        println!("║ Service ID: {}", device.service_id);
-                        println!("║ Unique ID: {}", device.unique_id);
-
-                        // Display name if available
-                        if let Some(Some(name)) = device.properties.get("display_name") {
-                            println!("║ Name: {}", name);
-                        }
-
-                        // Display HTTP port if available
-                        if let Some(Some(port)) = device.properties.get("http_port") {
-                            println!("║ HTTP Port: {}", port);
-                            println!("║ Connect: http://{}:{}", device.from.ip(), port);
-                        }
-
                         println!("║");
-                        println!("║ All Properties:");
                         for (key, value) in &device.properties {
                             match value {
-                                Some(val) => println!("║   {}: {}", key, val),
-                                None => println!("║   {}: null", key),
+                                Some(val) => println!("║ {}: {}", key, val),
+                                None => println!("║ {}: null", key),
                             }
                         }
                         println!("╚══════════════════════════════════════════════════\n");
