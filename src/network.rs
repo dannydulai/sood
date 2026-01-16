@@ -58,6 +58,46 @@ pub fn get_network_interfaces() -> Vec<NetworkInterface> {
     interfaces
 }
 
+/// Get all IPv4 loopback interfaces on the system
+///
+/// This function enumerates all network interfaces and returns only loopback interfaces
+/// with IPv4 addresses.
+///
+/// # Returns
+///
+/// A vector of `NetworkInterface` structures, one for each loopback interface.
+pub fn get_loopback_interfaces() -> Vec<NetworkInterface> {
+    let mut interfaces = Vec::new();
+
+    if let Ok(addrs) = if_addrs::get_if_addrs() {
+        for iface in addrs {
+            // Only include loopback interfaces
+            if !iface.is_loopback() {
+                continue;
+            }
+
+            // Only process IPv4 addresses
+            if let if_addrs::IfAddr::V4(addr) = iface.addr {
+                let ip = addr.ip;
+                let netmask = addr.netmask;
+                let broadcast = addr.broadcast.unwrap_or_else(|| {
+                    // Calculate broadcast if not provided
+                    calculate_broadcast(ip, netmask)
+                });
+
+                interfaces.push(NetworkInterface {
+                    name: iface.name,
+                    ip,
+                    netmask,
+                    broadcast,
+                });
+            }
+        }
+    }
+
+    interfaces
+}
+
 /// Calculate the broadcast address for a given IP and netmask
 ///
 /// The broadcast address is calculated by setting all host bits to 1.

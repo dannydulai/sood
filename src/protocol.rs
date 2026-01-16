@@ -210,6 +210,54 @@ pub fn serialize_query(properties: &mut HashMap<String, Option<String>>) -> Vec<
     buf
 }
 
+/// Serialize a SOOD response message
+///
+/// Similar to serialize_query but for response messages.
+///
+/// # Arguments
+///
+/// * `properties` - Key-value pairs to include in the response
+///
+/// # Returns
+///
+/// A buffer containing the serialized SOOD response message
+pub fn serialize_response(properties: &mut HashMap<String, Option<String>>) -> Vec<u8> {
+    // Estimate buffer size (conservative upper bound)
+    let mut buf = Vec::with_capacity(65535);
+
+    // Write header
+    buf.extend_from_slice(SOOD_HEADER);
+    buf.push(SOOD_VERSION);
+    buf.push(MessageType::Response.as_byte());
+
+    // Write properties
+    for (key, value) in properties.iter() {
+        let key_bytes = key.as_bytes();
+        let key_len = key_bytes.len().min(255); // Max key length is 255
+
+        // Write key length and key
+        buf.push(key_len as u8);
+        buf.extend_from_slice(&key_bytes[..key_len]);
+
+        // Write value length and value
+        match value {
+            None => {
+                // Null value
+                buf.extend_from_slice(&NULL_VALUE_MARKER.to_be_bytes());
+            }
+            Some(val) => {
+                let val_bytes = val.as_bytes();
+                let val_len = val_bytes.len().min(65534); // Max value length (0xFFFF is reserved)
+
+                buf.extend_from_slice(&(val_len as u16).to_be_bytes());
+                buf.extend_from_slice(&val_bytes[..val_len]);
+            }
+        }
+    }
+
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

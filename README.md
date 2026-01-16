@@ -10,9 +10,7 @@ Sood is a UDP-based service discovery protocol that uses multicast and broadcast
 
 - **Async/await API** using Tokio
 - **Automatic network interface monitoring** - detects when interfaces are added or removed
-- **Multicast and broadcast discovery** - sends queries via both methods for maximum compatibility
 - **Handles network changes gracefully** - adapts to changing network conditions
-- **Transaction ID auto-generation** - automatically assigns unique IDs to queries
 - **Multiple subscribers** - supports multiple message receivers simultaneously
 
 ## Installation
@@ -23,35 +21,6 @@ Add this to your `Cargo.toml`:
 [dependencies]
 sood = "0.1"
 tokio = { version = "1.0", features = ["full"] }
-```
-
-## Quick Start
-
-```rust
-use sood::{service_ids, Sood};
-
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
-    // Create and start the discovery client
-    let mut sood = Sood::new()?;
-    sood.start().await?;
-
-    // Get a receiver for discovered devices (includes past discoveries)
-    let mut devices = sood.discovered().await;
-
-    // Send a discovery query for Roon API services
-    sood.discover_service(service_ids::ROON_API).await?;
-
-    // Listen for discovered devices (automatically filtered and deduplicated)
-    while let Ok(device) = devices.recv().await {
-        println!("Discovered: {} at {}", device.unique_id, device.from);
-        if let Some(Some(port)) = device.properties.get("http_port") {
-            println!("  Connect: http://{}:{}", device.from.ip(), port);
-        }
-    }
-
-    Ok(())
-}
 ```
 
 ## Well-Known Service IDs
@@ -86,21 +55,21 @@ use sood::{service_ids, Sood};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    // Create and start the discovery client
     let mut sood = Sood::new()?;
     sood.start().await?;
 
-    // Get receiver - no race condition, includes past discoveries
+    // Get a receiver for discovered devices (includes past discoveries)
     let mut devices = sood.discovered().await;
 
-    // Simple discovery by service ID
+    // Send a discovery query for Roon API services
     sood.discover_service(service_ids::ROON_API).await?;
 
-    // Listen for devices - automatically filtered and deduplicated!
+    // Listen for discovered devices (automatically filtered and deduplicated)
     while let Ok(device) = devices.recv().await {
-        println!("Device {} at {}", device.unique_id, device.from.ip());
-
+        println!("Discovered: {} at {}", device.unique_id, device.from);
         if let Some(Some(port)) = device.properties.get("http_port") {
-            println!("  HTTP: http://{}:{}", device.from.ip(), port);
+            println!("  Connect: http://{}:{}", device.from.ip(), port);
         }
     }
 
@@ -138,7 +107,7 @@ async fn main() -> std::io::Result<()> {
 
 ### Advanced Queries
 
-For queries with multiple properties, use the `query()` method:
+For other SOOD queries, use the `query()` method:
 
 ```rust
 use sood::Sood;
@@ -151,8 +120,8 @@ async fn main() -> std::io::Result<()> {
 
     // Complex query with multiple properties
     let mut props = HashMap::new();
-    props.insert("query_service_id".to_string(), Some("00720724-5143-4a9b-abac-0e50cba674bb".to_string()));
-    props.insert("version".to_string(), Some("1.0".to_string()));
+    props.insert("foo".to_string(), Some("00000000-0000-0000-0000-000000000000".to_string()));
+    props.insert("bar".to_string(), Some("1.0".to_string()));
     sood.query(props).await?;
 
     Ok(())
@@ -161,94 +130,29 @@ async fn main() -> std::io::Result<()> {
 
 ### Raw Message Access
 
-For advanced use cases, you can access raw messages (responses only, query reflections are filtered out):
+For advanced use cases, you can access raw query responses directly:
 
 ```rust
 use sood::{service_ids, Sood};
+use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let mut sood = Sood::new()?;
-    let mut messages = sood.messages();
-
     sood.start().await?;
-    sood.discover_service(service_ids::ROON_API).await?;
 
-    // Process all response messages (including non-device responses)
-    while let Ok(msg) = messages.recv().await {
-        println!("Message from {}: {:?}", msg.from, msg.properties);
+    // Build query properties
+    let mut props = HashMap::new();
+    props.insert("query_service_id".to_string(), Some(service_ids::ROON_API.to_string()));
+
+    // Send query and get response stream
+    let mut responses = sood.query(props).await?;
+
+    // Process raw response messages (including non-device responses)
+    while let Some(msg) = responses.recv().await {
+        println!("Response from {}: {:?}", msg.from, msg.properties);
     }
 
-    Ok(())
-}
-```
-
-### Continuous Discovery with Periodic Queries
-
-```rust
-use sood::Sood;
-use std::time::Duration;
-
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
-    let mut sood = Sood::new()?;
-    sood.start().await?;
-
-    let mut devices = sood.discovered().await;
-    let service_id = "com.roon.app";
-
-    // Send queries every 10 seconds
-    let sood_ref = &sood;
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
-        loop {
-            interval.tick().await;
-            let _ = sood_ref.discover_service(service_id).await;
-        }
-    });
-
-    // Listen continuously - devices are automatically deduplicated
-    while let Ok(device) = devices.recv().await {
-        println!("Device: {} at {}", device.unique_id, device.from);
-    }
-
-    Ok(())
-}
-```
-
-### Multiple Device Receivers
-
-You can create multiple independent receivers that all get the same devices:
-
-```rust
-use sood::{service_ids, Sood};
-
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
-    let mut sood = Sood::new()?;
-    sood.start().await?;
-
-    // Create multiple independent receivers
-    let mut rx1 = sood.discovered().await;
-    let mut rx2 = sood.discovered().await;
-
-    sood.discover_service(service_ids::ROON_API).await?;
-
-    // Process devices in separate tasks
-    tokio::spawn(async move {
-        while let Ok(device) = rx1.recv().await {
-            println!("Handler 1: {}", device.unique_id);
-        }
-    });
-
-    tokio::spawn(async move {
-        while let Ok(device) = rx2.recv().await {
-            println!("Handler 2: {}", device.unique_id);
-        }
-    });
-
-    // Keep running...
-    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 ```

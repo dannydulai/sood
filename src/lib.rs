@@ -151,8 +151,6 @@ pub struct DiscoveredDevice {
     pub from: std::net::SocketAddr,
     /// Service ID
     pub service_id: String,
-    /// Unique device ID
-    pub unique_id: String,
     /// All device properties
     pub properties: HashMap<String, Option<String>>,
 }

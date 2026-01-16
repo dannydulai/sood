@@ -3,7 +3,7 @@
 //! This module provides the main [`SoodDiscovery`] struct that manages network
 //! sockets, sends queries, and receives messages.
 
-use crate::network::{get_network_interfaces, NetworkInterface};
+use crate::network::{get_loopback_interfaces, get_network_interfaces, NetworkInterface};
 use crate::protocol::{self, Message, MessageType};
 use crate::DiscoveredDevice;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -33,6 +33,7 @@ struct InterfaceState {
 /// Internal discovery engine state
 struct DiscoveryState {
     interfaces: HashMap<String, InterfaceState>,
+    loopback_interfaces: HashMap<String, InterfaceState>,
     unicast_socket: Option<Arc<UdpSocket>>,
     monitor_task: Option<JoinHandle<()>>,
     /// Track discovered devices by (service_id, unique_id) to prevent duplicates
@@ -62,6 +63,7 @@ impl SoodDiscovery {
 
         let state = DiscoveryState {
             interfaces: HashMap::new(),
+            loopback_interfaces: HashMap::new(),
             unicast_socket: None,
             monitor_task: None,
             discovered_devices: Arc::new(RwLock::new(HashMap::new())),
@@ -238,19 +240,21 @@ impl SoodDiscovery {
             let socket = Self::create_unicast_socket()?;
             let socket = Arc::new(socket);
 
-            // Spawn receive task for unicast socket
+            // Spawn receive task for unicast socket with loopback rebroadcast
             let recv_socket = Arc::clone(&socket);
             let message_tx = self.message_tx.clone();
             let discovered_tx = self.discovered_tx.clone();
             let discovered_devices = Arc::clone(&state.discovered_devices);
             let active_queries = Arc::clone(&state.active_queries);
+            let state_clone = Arc::clone(&self.state);
             tokio::spawn(async move {
-                Self::receive_loop(
+                Self::receive_loop_unicast(
                     recv_socket,
                     message_tx,
                     discovered_tx,
                     discovered_devices,
                     active_queries,
+                    state_clone,
                 )
                 .await;
             });
@@ -278,6 +282,32 @@ impl SoodDiscovery {
                     }
                     Err(e) => {
                         tracing::warn!("Failed to setup interface {}: {}", name, e);
+                    }
+                }
+            }
+        }
+
+        // Add or update loopback interfaces
+        let loopback_interfaces = get_loopback_interfaces();
+        for iface in loopback_interfaces {
+            let name = iface.name.clone();
+
+            if !state.loopback_interfaces.contains_key(&name) {
+                // New loopback interface - create sockets
+                match Self::setup_interface(
+                    iface,
+                    self.message_tx.clone(),
+                    self.discovered_tx.clone(),
+                    Arc::clone(&state.discovered_devices),
+                    Arc::clone(&state.active_queries),
+                )
+                .await
+                {
+                    Ok(iface_state) => {
+                        state.loopback_interfaces.insert(name, iface_state);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to setup loopback interface {}: {}", name, e);
                     }
                 }
             }
@@ -454,6 +484,136 @@ impl SoodDiscovery {
         UdpSocket::from_std(socket.into())
     }
 
+    /// Receive loop for unicast socket with loopback rebroadcast
+    async fn receive_loop_unicast(
+        socket: Arc<UdpSocket>,
+        message_tx: broadcast::Sender<Message>,
+        discovered_tx: broadcast::Sender<DiscoveredDevice>,
+        discovered_devices: Arc<RwLock<HashMap<(String, String), DiscoveredDevice>>>,
+        active_queries: Arc<RwLock<HashMap<Uuid, broadcast::Sender<Message>>>>,
+        state: Arc<RwLock<DiscoveryState>>,
+    ) {
+        let mut buf = vec![0u8; MESSAGE_BUFFER_SIZE];
+
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((len, from)) => {
+                    tracing::debug!("Received {} bytes from {} on unicast socket", len, from);
+                    tracing::trace!("Raw data: {:02X?}", &buf[..len.min(100)]);
+
+                    if let Some(msg) = protocol::parse_message(&buf[..len], from) {
+                        tracing::debug!("Successfully parsed message from {}", from);
+
+                        // Loopback rebroadcast: if this message doesn't have _replyaddr,
+                        // rebroadcast it to all loopback interfaces
+                        if !msg.properties.contains_key("_replyaddr") {
+                            let mut rebroadcast_props = msg.properties.clone();
+                            rebroadcast_props.insert("_replyaddr".to_string(), Some(from.ip().to_string()));
+
+                            // Add _replyport if not present
+                            if !rebroadcast_props.contains_key("_replyport") {
+                                rebroadcast_props.insert("_replyport".to_string(), Some(from.port().to_string()));
+                            }
+
+                            // Serialize the modified message
+                            let rebroadcast_buf = if msg.msg_type == MessageType::Query {
+                                protocol::serialize_query(&mut rebroadcast_props)
+                            } else {
+                                protocol::serialize_response(&mut rebroadcast_props)
+                            };
+
+                            // Send to all loopback interfaces
+                            let state_read = state.read().await;
+                            for iface_state in state_read.loopback_interfaces.values() {
+                                if let Some(send_socket) = &iface_state.send_socket {
+                                    // Send to multicast address
+                                    let multicast_addr = SocketAddr::V4(SocketAddrV4::new(SOOD_MULTICAST_IP, SOOD_PORT));
+                                    if let Err(e) = send_socket.send_to(&rebroadcast_buf, multicast_addr).await {
+                                        tracing::debug!(
+                                            "Failed to rebroadcast to loopback interface {}: {}",
+                                            iface_state.info.name,
+                                            e
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            "Rebroadcast message to loopback interface {}",
+                                            iface_state.info.name
+                                        );
+                                    }
+
+                                    // Also send to broadcast address
+                                    let broadcast_addr = SocketAddr::V4(SocketAddrV4::new(iface_state.info.broadcast, SOOD_PORT));
+                                    if let Err(e) = send_socket.send_to(&rebroadcast_buf, broadcast_addr).await {
+                                        tracing::debug!(
+                                            "Failed to rebroadcast to loopback broadcast {}: {}",
+                                            iface_state.info.name,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // Handle Response messages
+                        if msg.msg_type == MessageType::Response {
+                            // Check if this response matches any active query
+                            if let Some(Some(tid_str)) = msg.properties.get("_tid") {
+                                // Parse the _tid as a UUID
+                                if let Ok(tid) = Uuid::parse_str(tid_str) {
+                                    let queries = active_queries.read().await;
+                                    if let Some(query_tx) = queries.get(&tid) {
+                                        // Send to the specific query stream
+                                        let _ = query_tx.send(msg.clone());
+                                    }
+                                }
+                            }
+
+                            // Also send to general messages channel (for backward compatibility)
+                            let _ = message_tx.send(msg.clone());
+                        }
+
+                        // Check if it's a device announcement (Query or Response with service_id and unique_id)
+                        // This handles both unsolicited Query announcements and Response messages
+                        if let Some(Some(service_id)) = msg.properties.get("service_id") {
+                            // Special case: ROON_OS uses serial_number instead of unique_id
+                            let unique_id = if service_id == "ecb37afa-665f-4693-9fba-54823b6f1ff1" {
+                                msg.properties.get("serial_number")
+                                    .and_then(|v| v.as_ref())
+                            } else {
+                                msg.properties.get("unique_id")
+                                    .and_then(|v| v.as_ref())
+                            };
+
+                            if let Some(unique_id) = unique_id {
+                                let key = (service_id.clone(), unique_id.clone());
+
+                                // Check if we've seen this device before
+                                let mut devices = discovered_devices.write().await;
+                                if !devices.contains_key(&key) {
+                                    // New device - store and emit it
+                                    let device = DiscoveredDevice {
+                                        from: msg.from,
+                                        service_id: service_id.clone(),
+                                        properties: msg.properties.clone(),
+                                    };
+                                    devices.insert(key, device.clone());
+                                    let _ = discovered_tx.send(device);
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::debug!("Failed to parse message from {}", from);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Socket receive error: {}", e);
+                    // Don't break - temporary errors are common
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
     /// Receive loop for a socket
     async fn receive_loop(
         socket: Arc<UdpSocket>,
@@ -513,7 +673,6 @@ impl SoodDiscovery {
                                     let device = DiscoveredDevice {
                                         from: msg.from,
                                         service_id: service_id.clone(),
-                                        unique_id: unique_id.clone(),
                                         properties: msg.properties.clone(),
                                     };
                                     devices.insert(key, device.clone());
