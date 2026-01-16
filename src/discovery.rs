@@ -4,7 +4,8 @@
 //! sockets, sends queries, and receives messages.
 
 use crate::network::{get_network_interfaces, NetworkInterface};
-use crate::protocol::{self, Message};
+use crate::protocol::{self, Message, MessageType};
+use crate::DiscoveredDevice;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::io;
@@ -14,6 +15,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 const SOOD_PORT: u16 = 9003;
 const SOOD_MULTICAST_IP: Ipv4Addr = Ipv4Addr::new(239, 255, 90, 90);
@@ -33,6 +35,10 @@ struct DiscoveryState {
     interfaces: HashMap<String, InterfaceState>,
     unicast_socket: Option<Arc<UdpSocket>>,
     monitor_task: Option<JoinHandle<()>>,
+    /// Track discovered devices by (service_id, unique_id) to prevent duplicates
+    discovered_devices: Arc<RwLock<HashMap<(String, String), DiscoveredDevice>>>,
+    /// Track active queries by transaction ID (UUID)
+    active_queries: Arc<RwLock<HashMap<Uuid, broadcast::Sender<Message>>>>,
 }
 
 /// SOOD discovery engine
@@ -43,29 +49,55 @@ pub struct SoodDiscovery {
     state: Arc<RwLock<DiscoveryState>>,
     message_tx: broadcast::Sender<Message>,
     _message_rx: broadcast::Receiver<Message>,
+    /// Channel for discovered devices (filtered and deduplicated)
+    discovered_tx: broadcast::Sender<DiscoveredDevice>,
+    _discovered_rx: broadcast::Receiver<DiscoveredDevice>,
 }
 
 impl SoodDiscovery {
     /// Create a new SOOD discovery engine
     pub fn new() -> Self {
         let (message_tx, message_rx) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+        let (discovered_tx, discovered_rx) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
 
         let state = DiscoveryState {
             interfaces: HashMap::new(),
             unicast_socket: None,
             monitor_task: None,
+            discovered_devices: Arc::new(RwLock::new(HashMap::new())),
+            active_queries: Arc::new(RwLock::new(HashMap::new())),
         };
 
         Self {
             state: Arc::new(RwLock::new(state)),
             message_tx,
             _message_rx: message_rx,
+            discovered_tx,
+            _discovered_rx: discovered_rx,
         }
     }
 
-    /// Get a receiver for discovered messages
+    /// Get a receiver for all messages (responses only, no query reflections)
     pub fn subscribe(&self) -> broadcast::Receiver<Message> {
         self.message_tx.subscribe()
+    }
+
+    /// Get a receiver for discovered devices with past devices included
+    pub async fn subscribe_discovered_with_history(
+        &self,
+    ) -> (Vec<DiscoveredDevice>, broadcast::Receiver<DiscoveredDevice>) {
+        let past_devices = self.get_discovered_devices().await;
+        let receiver = self.discovered_tx.subscribe();
+        (past_devices, receiver)
+    }
+
+    /// Get all discovered devices
+    ///
+    /// Returns a snapshot of all devices discovered so far.
+    pub async fn get_discovered_devices(&self) -> Vec<DiscoveredDevice> {
+        let state = self.state.read().await;
+        let devices = state.discovered_devices.read().await;
+        devices.values().cloned().collect()
     }
 
     /// Start the discovery engine
@@ -76,11 +108,18 @@ impl SoodDiscovery {
         // Start the interface monitoring task
         let state = Arc::clone(&self.state);
         let message_tx = self.message_tx.clone();
+        let discovered_tx = self.discovered_tx.clone();
         let monitor_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(INTERFACE_CHECK_INTERVAL);
             loop {
                 interval.tick().await;
-                if let Err(e) = Self::check_interfaces(Arc::clone(&state), message_tx.clone()).await {
+                if let Err(e) = Self::check_interfaces(
+                    Arc::clone(&state),
+                    message_tx.clone(),
+                    discovered_tx.clone(),
+                )
+                .await
+                {
                     tracing::warn!("Interface check failed: {}", e);
                 }
             }
@@ -91,9 +130,49 @@ impl SoodDiscovery {
         Ok(())
     }
 
-    /// Send a SOOD query
-    pub async fn query(&self, mut properties: HashMap<String, Option<String>>) -> io::Result<()> {
+    /// Send a SOOD query and return a stream of responses
+    ///
+    /// The returned stream will receive responses with a matching transaction ID.
+    /// The stream automatically closes after 5 seconds.
+    pub async fn query(
+        &self,
+        mut properties: HashMap<String, Option<String>>,
+    ) -> io::Result<broadcast::Receiver<Message>> {
         let buf = protocol::serialize_query(&mut properties);
+
+        // Get the transaction ID that was assigned (or generated) and parse it as UUID
+        let tid_str = properties
+            .get("_tid")
+            .and_then(|v| v.as_ref())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing _tid"))?;
+
+        let tid = Uuid::parse_str(tid_str).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid UUID for _tid: {}", e),
+            )
+        })?;
+
+        // Create a channel for responses to this query
+        let (query_tx, query_rx) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+
+        // Store the channel in active_queries
+        {
+            let state = self.state.read().await;
+            let mut active_queries = state.active_queries.write().await;
+            active_queries.insert(tid, query_tx);
+        }
+
+        // Spawn a task to remove the query after 5 seconds
+        let state_clone = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let state = state_clone.read().await;
+            let mut active_queries = state.active_queries.write().await;
+            active_queries.remove(&tid);
+            tracing::debug!("Query stream for tid {} closed after timeout", tid);
+        });
+
         let state = self.state.read().await;
 
         // Send via all multicast interfaces
@@ -129,7 +208,7 @@ impl SoodDiscovery {
             }
         }
 
-        Ok(())
+        Ok(query_rx)
     }
 
     /// Stop the discovery engine
@@ -162,8 +241,18 @@ impl SoodDiscovery {
             // Spawn receive task for unicast socket
             let recv_socket = Arc::clone(&socket);
             let message_tx = self.message_tx.clone();
+            let discovered_tx = self.discovered_tx.clone();
+            let discovered_devices = Arc::clone(&state.discovered_devices);
+            let active_queries = Arc::clone(&state.active_queries);
             tokio::spawn(async move {
-                Self::receive_loop(recv_socket, message_tx).await;
+                Self::receive_loop(
+                    recv_socket,
+                    message_tx,
+                    discovered_tx,
+                    discovered_devices,
+                    active_queries,
+                )
+                .await;
             });
 
             state.unicast_socket = Some(socket);
@@ -175,7 +264,15 @@ impl SoodDiscovery {
 
             if !state.interfaces.contains_key(&name) {
                 // New interface - create sockets
-                match Self::setup_interface(iface, self.message_tx.clone()).await {
+                match Self::setup_interface(
+                    iface,
+                    self.message_tx.clone(),
+                    self.discovered_tx.clone(),
+                    Arc::clone(&state.discovered_devices),
+                    Arc::clone(&state.active_queries),
+                )
+                .await
+                {
                     Ok(iface_state) => {
                         state.interfaces.insert(name, iface_state);
                     }
@@ -193,6 +290,7 @@ impl SoodDiscovery {
     async fn check_interfaces(
         state: Arc<RwLock<DiscoveryState>>,
         message_tx: broadcast::Sender<Message>,
+        discovered_tx: broadcast::Sender<DiscoveredDevice>,
     ) -> io::Result<()> {
         let current_interfaces = get_network_interfaces();
         let mut state = state.write().await;
@@ -219,7 +317,17 @@ impl SoodDiscovery {
             let name = iface.name.clone();
             if !state.interfaces.contains_key(&name) {
                 tracing::info!("New interface detected: {}", name);
-                match Self::setup_interface(iface, message_tx.clone()).await {
+                let discovered_devices = Arc::clone(&state.discovered_devices);
+                let active_queries = Arc::clone(&state.active_queries);
+                match Self::setup_interface(
+                    iface,
+                    message_tx.clone(),
+                    discovered_tx.clone(),
+                    discovered_devices,
+                    active_queries,
+                )
+                .await
+                {
                     Ok(iface_state) => {
                         state.interfaces.insert(name, iface_state);
                     }
@@ -237,6 +345,9 @@ impl SoodDiscovery {
     async fn setup_interface(
         info: NetworkInterface,
         message_tx: broadcast::Sender<Message>,
+        discovered_tx: broadcast::Sender<DiscoveredDevice>,
+        discovered_devices: Arc<RwLock<HashMap<(String, String), DiscoveredDevice>>>,
+        active_queries: Arc<RwLock<HashMap<Uuid, broadcast::Sender<Message>>>>,
     ) -> io::Result<InterfaceState> {
         // Create multicast receive socket
         let recv_socket = Self::create_multicast_recv_socket(info.ip)?;
@@ -245,8 +356,18 @@ impl SoodDiscovery {
         // Spawn receive task
         let recv_task_socket = Arc::clone(&recv_socket);
         let recv_task_tx = message_tx.clone();
+        let recv_task_discovered_tx = discovered_tx.clone();
+        let recv_task_discovered_devices = Arc::clone(&discovered_devices);
+        let recv_task_active_queries = Arc::clone(&active_queries);
         let recv_task = tokio::spawn(async move {
-            Self::receive_loop(recv_task_socket, recv_task_tx).await;
+            Self::receive_loop(
+                recv_task_socket,
+                recv_task_tx,
+                recv_task_discovered_tx,
+                recv_task_discovered_devices,
+                recv_task_active_queries,
+            )
+            .await;
         });
 
         // Create send socket
@@ -257,8 +378,18 @@ impl SoodDiscovery {
         // Devices respond to the source IP:port of queries, which is this send socket
         let send_socket_rx = Arc::clone(&send_socket);
         let send_socket_tx = message_tx.clone();
+        let send_socket_discovered_tx = discovered_tx.clone();
+        let send_socket_discovered_devices = Arc::clone(&discovered_devices);
+        let send_socket_active_queries = Arc::clone(&active_queries);
         tokio::spawn(async move {
-            Self::receive_loop(send_socket_rx, send_socket_tx).await;
+            Self::receive_loop(
+                send_socket_rx,
+                send_socket_tx,
+                send_socket_discovered_tx,
+                send_socket_discovered_devices,
+                send_socket_active_queries,
+            )
+            .await;
         });
 
         Ok(InterfaceState {
@@ -324,7 +455,13 @@ impl SoodDiscovery {
     }
 
     /// Receive loop for a socket
-    async fn receive_loop(socket: Arc<UdpSocket>, message_tx: broadcast::Sender<Message>) {
+    async fn receive_loop(
+        socket: Arc<UdpSocket>,
+        message_tx: broadcast::Sender<Message>,
+        discovered_tx: broadcast::Sender<DiscoveredDevice>,
+        discovered_devices: Arc<RwLock<HashMap<(String, String), DiscoveredDevice>>>,
+        active_queries: Arc<RwLock<HashMap<Uuid, broadcast::Sender<Message>>>>,
+    ) {
         let mut buf = vec![0u8; MESSAGE_BUFFER_SIZE];
 
         loop {
@@ -335,8 +472,47 @@ impl SoodDiscovery {
 
                     if let Some(msg) = protocol::parse_message(&buf[..len], from) {
                         tracing::debug!("Successfully parsed message from {}", from);
-                        // Ignore send errors - just means no active receivers
-                        let _ = message_tx.send(msg);
+
+                        // Handle Response messages
+                        if msg.msg_type == MessageType::Response {
+                            // Check if this response matches any active query
+                            if let Some(Some(tid_str)) = msg.properties.get("_tid") {
+                                // Parse the _tid as a UUID
+                                if let Ok(tid) = Uuid::parse_str(tid_str) {
+                                    let queries = active_queries.read().await;
+                                    if let Some(query_tx) = queries.get(&tid) {
+                                        // Send to the specific query stream
+                                        let _ = query_tx.send(msg.clone());
+                                    }
+                                }
+                            }
+
+                            // Also send to general messages channel (for backward compatibility)
+                            let _ = message_tx.send(msg.clone());
+                        }
+
+                        // Check if it's a device announcement (Query or Response with service_id and unique_id)
+                        // This handles both unsolicited Query announcements and Response messages
+                        if let (Some(Some(service_id)), Some(Some(unique_id))) = (
+                            msg.properties.get("service_id"),
+                            msg.properties.get("unique_id"),
+                        ) {
+                            let key = (service_id.clone(), unique_id.clone());
+
+                            // Check if we've seen this device before
+                            let mut devices = discovered_devices.write().await;
+                            if !devices.contains_key(&key) {
+                                // New device - store and emit it
+                                let device = DiscoveredDevice {
+                                    from: msg.from,
+                                    service_id: service_id.clone(),
+                                    unique_id: unique_id.clone(),
+                                    properties: msg.properties.clone(),
+                                };
+                                devices.insert(key, device.clone());
+                                let _ = discovered_tx.send(device);
+                            }
+                        }
                     } else {
                         tracing::debug!("Failed to parse message from {}", from);
                     }
