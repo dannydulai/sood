@@ -168,26 +168,9 @@ cargo run --example discover
 
 The example will:
 1. Start listening on all network interfaces
-2. Send periodic discovery queries
+2. Send a discovery query for RAAT_ENDPOINTS
 3. Display discovered devices with their properties
 4. Handle Ctrl+C for clean shutdown
-
-## Architecture
-
-The library is organized into several modules:
-
-- **`protocol`**: Message parsing and serialization
-- **`network`**: Network interface enumeration and utilities
-- **`discovery`**: Core discovery engine with socket management
-- **`lib`**: Public API
-
-### How It Works
-
-1. **Initialization**: Creates sockets for each network interface
-2. **Multicast Listening**: Binds to port 9003 and joins multicast group on each interface
-3. **Broadcast Sending**: Sends queries to both multicast and broadcast addresses
-4. **Interface Monitoring**: Checks for interface changes every 5 seconds
-5. **Message Distribution**: Uses Tokio broadcast channels to distribute received messages
 
 ## Platform Support
 
@@ -217,12 +200,7 @@ tracing_subscriber::fmt()
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
+Licensed under the MIT license ([LICENSE-MIT](LICENSE-MIT)).
 
 ## Contributing
 
