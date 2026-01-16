@@ -1,10 +1,10 @@
-# Sood - Service-Oriented Object Discovery
+# SOOD - **SOO**loos **D**iscovery Protocol
 
-A Rust implementation of the Sood discovery protocol used by Roon for discovering the Core as well as audio endpoints on the local network.
+A Rust implementation of the SOOD discovery protocol used by [Roon](https://roon.app/) for discovering the Core as well as audio endpoints on the local network.
 
 ## Overview
 
-Sood is a UDP-based service discovery protocol that uses multicast and broadcast to discover devices on the local network. This crate provides a simple async API for sending discovery queries and receiving responses.
+SOOD is a UDP-based service discovery protocol that uses multicast and broadcast to discover devices on the local network. This crate provides a simple async API for sending discovery queries and receiving responses.
 
 ## Features
 
@@ -205,11 +205,6 @@ Licensed under the MIT license ([LICENSE](LICENSE)).
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
-
-## References
-
-- [Roon](https://roonlabs.com/) - The audio player that uses this protocol
-- Original Node.js implementation: Based on the reference implementation
 
 ## Troubleshooting
 
