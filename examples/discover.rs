@@ -33,7 +33,7 @@ async fn main() -> std::io::Result<()> {
 
     // Send a discovery query for Roon services
     println!("Sending discovery query for Roon services...\n");
-    sood.discover_service(service_ids::RAAT_ENDPOINT).await?;
+    sood.discover_service(service_ids::ROON_API).await?;
 
     // Listen for devices
     println!("Listening for devices... (Press Ctrl+C to exit)\n");
